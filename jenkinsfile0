@@ -1,0 +1,107 @@
+pipeline {
+    agent any
+
+    environment {
+        TERRAFORM_HOME = "${env.WORKSPACE}/terraform"
+        AWS_DEFAULT_REGION = 'us-west-2'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Check out the code and stash it as "IaCdemo"
+                git branch: 'main', url: 'https://github.com/setthapong4u/IaCdemo'
+                stash includes: '**/*', name: 'IaCdemo' // Stash all files under the name "IaCdemo"
+            }
+        }
+
+        stage('Install Terraform') {
+            steps {
+                script {
+                    if (!fileExists("${TERRAFORM_HOME}/terraform")) {
+                        sh "mkdir -p ${TERRAFORM_HOME}"
+                        sh "curl -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip"
+                        sh "unzip /tmp/terraform.zip -d ${TERRAFORM_HOME}"
+                        sh "chmod +x ${TERRAFORM_HOME}/terraform"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials-panw',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    script {
+                        unstash 'IaCdemo' // Retrieve stashed files
+                        sh "${TERRAFORM_HOME}/terraform init"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials-panw',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    script {
+                        unstash 'IaCdemo' // Retrieve stashed files
+                        sh "${TERRAFORM_HOME}/terraform plan -out tf.plan"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Show') {
+            steps {
+                script {
+                    unstash 'IaCdemo' // Retrieve stashed files
+                    sh "${TERRAFORM_HOME}/terraform show -json tf.plan > tf.json"
+                }
+            }
+        }
+
+        stage('Code Scanning by Prisma') {
+            steps {
+                script {
+                    docker.image('bridgecrew/checkov:latest').inside("--entrypoint='' -u 0:0") {
+                        unstash 'IaCdemo' // Retrieve stashed files
+                        try {
+                            withCredentials([
+                                string(credentialsId: 'PRISMA_ACCESS_KEY', variable: 'USER'),
+                                string(credentialsId: 'PRISMA_SECRET_KEY', variable: 'PASS'),
+                                string(credentialsId: 'API_JP_URL', variable: 'URL_API')
+                            ]) {
+                                sh '''
+                                checkov -d . --use-enforcement-rules -o cli -o junitxml \
+                                --output-file-path console,results.xml \
+                                --repo-id example/IaCdemo \
+                                --branch main \
+                                --bc-api-key "${USER}::${PASS}" \
+                                --prisma-api-url "${URL_API}"
+                                '''
+                            }
+                            junit skipPublishingChecks: true, testResults: 'results.xml'
+                        } catch (err) {
+                            junit skipPublishingChecks: true, testResults: 'results.xml'
+                            throw err
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    options {
+        preserveStashes()
+        timestamps()
+    }
+}
